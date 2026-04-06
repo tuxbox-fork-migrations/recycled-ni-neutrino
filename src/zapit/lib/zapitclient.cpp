@@ -1170,6 +1170,43 @@ void CZapitClient::unlockPlayBack(const bool sendpmt)
 	close_connection();
 }
 
+#ifdef HAVE_SOFTCSA
+int CZapitClient::stopSoftCSADecoder(int adapter, int demux_unit,
+                                      const unsigned short *pids, int num_pids)
+{
+	OpenThreads::ScopedLock<OpenThreads::Mutex> lock(mutex);
+	CZapitMessages::commandSoftCSAStop msg;
+	memset(&msg, 0, sizeof(msg));
+	msg.adapter = adapter;
+	msg.demux_unit = demux_unit;
+	msg.num_pids = (num_pids > 32) ? 32 : num_pids;
+	for (int i = 0; i < msg.num_pids; i++)
+		msg.pids[i] = pids[i];
+	send(CZapitMessages::CMD_SOFTCSA_STOP_DECODER, (char *)&msg, sizeof(msg));
+	CZapitMessages::responseSoftCSAStop response;
+	CBasicClient::receive_data((char*)&response, sizeof(response));
+	close_connection();
+	return response.reader_fd;
+}
+
+void CZapitClient::startSoftCSADecoder(int decode_demux, int adapter, unsigned short vpid, unsigned short apid, unsigned short pcrpid, int video_type, int audio_type)
+{
+	OpenThreads::ScopedLock<OpenThreads::Mutex> lock(mutex);
+	CZapitMessages::commandSoftCSAStart msg;
+	msg.decode_demux = decode_demux;
+	msg.adapter = adapter;
+	msg.vpid = vpid;
+	msg.apid = apid;
+	msg.pcrpid = pcrpid;
+	msg.video_type = video_type;
+	msg.audio_type = audio_type;
+	send(CZapitMessages::CMD_SOFTCSA_START_DECODER, (char *)&msg, sizeof(msg));
+	CZapitMessages::responseCmd response;
+	CBasicClient::receive_data((char*)&response, sizeof(response));
+	close_connection();
+}
+#endif
+
 bool CZapitClient::isPlayBackActive()
 {
 	OpenThreads::ScopedLock<OpenThreads::Mutex> lock(mutex);

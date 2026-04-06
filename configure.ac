@@ -84,6 +84,17 @@ AC_ARG_ENABLE(ffmpegdec,
 	AC_DEFINE(ENABLE_FFMPEGDEC, 1, [include ffmpeg decoder support]))
 AM_CONDITIONAL(ENABLE_FFMPEGDEC, test "$enable_ffmpegdec" = "yes")
 
+AC_ARG_ENABLE(softcsa,
+	AS_HELP_STRING([--enable-softcsa], [enable software descrambling via libdvbcsa]),
+	,[enable_softcsa=no])
+
+AM_CONDITIONAL(ENABLE_SOFTCSA, test "$enable_softcsa" = "yes")
+
+if test "$enable_softcsa" = "yes"; then
+	PKG_CHECK_MODULES([DVBCSA], [libdvbcsa])
+	AC_DEFINE(HAVE_SOFTCSA, 1, [enable software descrambling])
+fi
+
 if test "$enable_ffmpegdec" != "yes"; then
 
 AC_ARG_WITH(tremor,
@@ -731,6 +742,7 @@ src/driver/Makefile
 src/driver/audiodec/Makefile
 src/driver/glcd/Makefile
 src/driver/pictureviewer/Makefile
+src/driver/softcsa/Makefile
 src/eitd/Makefile
 src/gui/Makefile
 src/gui/bedit/Makefile

@@ -75,6 +75,15 @@
 #include <neutrino.h>
 #include <gui/osd_helpers.h>
 
+#ifdef HAVE_SOFTCSA
+#include "dvbapi_client.h"
+#include <driver/softcsa/softcsa_manager.h>
+#include <dmx_hal.h>           /* dmx_pes_filter_params, DMX_SET_PES_FILTER, etc. */
+#include <linux/dvb/audio.h>   /* AUDIO_SELECT_SOURCE, AUDIO_PLAY, etc. */
+#include <linux/dvb/video.h>   /* VIDEO_SELECT_SOURCE, VIDEO_PLAY, etc. */
+extern void CCamManager_SetDvbApiClient(CDvbApiClient *client);
+#endif
+
 #ifdef PEDANTIC_VALGRIND_SETUP
 #define VALGRIND_PARANOIA(x) memset(&x, 0, sizeof(x))
 #else
@@ -94,6 +103,17 @@ extern cVideo *videoDecoder;
 extern cAudio *audioDecoder;
 extern cDemux *audioDemux;
 extern cDemux *videoDemux;
+
+#ifdef HAVE_SOFTCSA
+/* SoftCSA decoder fds — managed directly (bypassing HAL) for correct
+ * ioctl ordering. Closed in CMD_STOP_DECODER and StopPlayBack. */
+static int softcsa_decode_video_fd = -1;
+static int softcsa_decode_audio_fd = -1;
+static int softcsa_decode_pcr_fd = -1;
+static int softcsa_video_dev_fd = -1;
+static int softcsa_audio_dev_fd = -1;
+static bool softcsa_decoder_stopped = false;
+#endif
 
 #if ENABLE_PIP
 extern cVideo *pipVideoDecoder[3];
@@ -739,6 +759,9 @@ bool CZapit::StopPip(int pip)
 
 	if (pip_channel_id[pip]) {
 		INFO("[pip %d] stop %llx", pip, pip_channel_id[pip]);
+#ifdef HAVE_SOFTCSA
+		CSoftCSAManager::getInstance()->stopSession(pip_channel_id[pip], SOFTCSA_SESSION_PIP);
+#endif
 		CCamManager::getInstance()->Stop(pip_channel_id[pip], CCamManager::PIP);
 		pip_fe[pip] = NULL;
 		pip_channel_id[pip] = 0;
@@ -1962,7 +1985,6 @@ bool CZapit::ParseCommand(CBasicMessage::Header &rmsg, int connfd)
 		StopPlayBack(msgBool.truefalse, false);
 		playbackStopForced = true;
 		lock_channel_id = live_channel_id;
-		//lockPlayBack();
 		SendCmdReady(connfd);
 		break;
 	}
@@ -1985,6 +2007,278 @@ bool CZapit::ParseCommand(CBasicMessage::Header &rmsg, int connfd)
 		SendCmdReady(connfd);
 		break;
 	}
+#ifdef HAVE_SOFTCSA
+	case CZapitMessages::CMD_SOFTCSA_STOP_DECODER:
+	{
+		/* Enigma2-identical sequence: stop decoder, then open reader on demux0
+		 * in the SAME thread context. No IPC gap between close and open.
+		 * Section filter fds (pmtDemux, sectionsd) remain open on demux0,
+		 * keeping XPT state alive throughout the transition. */
+		CZapitMessages::commandSoftCSAStop msg;
+		CBasicServer::receive_data(connfd, &msg, sizeof(msg));
+
+		/* Clamp num_pids to array bounds (defensive, client already clamps) */
+		if (msg.num_pids < 0) msg.num_pids = 0;
+		if (msg.num_pids > 32) msg.num_pids = 32;
+
+		printf("[softcsa] CMD_STOP_DECODER: adapter=%d demux=%d num_pids=%d\n",
+			msg.adapter, msg.demux_unit, msg.num_pids);
+
+		/* === Phase 1: Close decoder PES filters (DMX_STOP + close) === */
+		if (videoDemux) videoDemux->Close();
+		if (audioDemux) audioDemux->Close();
+		if (pcrDemux) pcrDemux->Close();
+		if (audioDecoder)
+			audioDecoder->Stop();
+		if (videoDecoder)
+			videoDecoder->Stop(false);
+		if (videoDecoder)
+			videoDecoder->closeDevice();
+		if (audioDecoder)
+			audioDecoder->closeDevice();
+
+		/* Close any fds from a previous SoftCSA session */
+		if (softcsa_decode_video_fd >= 0) {
+			::close(softcsa_decode_video_fd);
+			softcsa_decode_video_fd = -1;
+		}
+		if (softcsa_decode_audio_fd >= 0) {
+			::close(softcsa_decode_audio_fd);
+			softcsa_decode_audio_fd = -1;
+		}
+		if (softcsa_decode_pcr_fd >= 0) {
+			::close(softcsa_decode_pcr_fd);
+			softcsa_decode_pcr_fd = -1;
+		}
+		if (softcsa_video_dev_fd >= 0) {
+			::close(softcsa_video_dev_fd);
+			softcsa_video_dev_fd = -1;
+		}
+		if (softcsa_audio_dev_fd >= 0) {
+			::close(softcsa_audio_dev_fd);
+			softcsa_audio_dev_fd = -1;
+		}
+
+		printf("[softcsa] CMD_STOP_DECODER: decoder closed\n");
+		softcsa_decoder_stopped = true;
+
+		/* === Phase 2: Open reader on demux0 (same thread, no gap) === */
+		CZapitMessages::responseSoftCSAStop response;
+		response.reader_fd = -1;
+
+		if (msg.num_pids > 0) {
+			char demux_path[64];
+			snprintf(demux_path, sizeof(demux_path), "/dev/dvb/adapter%d/demux%d",
+				msg.adapter, msg.demux_unit);
+
+			int rfd = ::open(demux_path, O_RDONLY | O_CLOEXEC);
+			if (rfd >= 0) {
+				/* 1MB buffer — matches Enigma2 */
+				if (ioctl(rfd, DMX_SET_BUFFER_SIZE, 1024 * 1024) < 0)
+					printf("[softcsa] DMX_SET_BUFFER_SIZE 1MB failed: %s\n", strerror(errno));
+
+				/* TSDEMUX_TAP with PAT as primary PID — matches Enigma2 */
+				struct dmx_pes_filter_params pes;
+				memset(&pes, 0, sizeof(pes));
+				pes.pid = msg.pids[0];
+				pes.input = DMX_IN_FRONTEND;
+				pes.output = DMX_OUT_TSDEMUX_TAP;
+				pes.pes_type = DMX_PES_OTHER;
+				pes.flags = 0;
+
+				if (ioctl(rfd, DMX_SET_PES_FILTER, &pes) == 0 &&
+				    ioctl(rfd, DMX_START) == 0) {
+					/* Add remaining PIDs */
+					for (int i = 1; i < msg.num_pids; i++) {
+						uint16_t p = msg.pids[i];
+						if (ioctl(rfd, DMX_ADD_PID, &p) < 0)
+							printf("[softcsa] DMX_ADD_PID %04x failed: %s\n",
+								p, strerror(errno));
+					}
+					response.reader_fd = rfd;
+					printf("[softcsa] CMD_STOP_DECODER: reader on demux%d fd=%d, %d PIDs\n",
+						msg.demux_unit, rfd, msg.num_pids);
+				} else {
+					printf("[softcsa] CMD_STOP_DECODER: PES filter/start failed: %s\n",
+						strerror(errno));
+					::close(rfd);
+				}
+			} else {
+				printf("[softcsa] CMD_STOP_DECODER: open %s failed: %s\n",
+					demux_path, strerror(errno));
+			}
+		}
+
+		CBasicServer::send_data(connfd, &response, sizeof(response));
+		break;
+	}
+	case CZapitMessages::CMD_SOFTCSA_START_DECODER:
+	{
+		/* Atomic decoder setup: open fresh device fd → SELECT_SOURCE(DEMUX)
+		 * → PES filter on decode demux → PLAY. All in one handler to
+		 * ensure VIDEO_SELECT_SOURCE is called immediately before
+		 * DMX_SET_PES_FILTER VIDEO0. Audio first, then video. */
+		CZapitMessages::commandSoftCSAStart msg;
+		CBasicServer::receive_data(connfd, &msg, sizeof(msg));
+
+		printf("[softcsa] CMD_START_DECODER: decode_demux=%d vpid=%04x apid=%04x pcrpid=%04x vtype=%d atype=%d\n",
+			msg.decode_demux, msg.vpid, msg.apid, msg.pcrpid, msg.video_type, msg.audio_type);
+
+		if (msg.decode_demux < 0) {
+			printf("[softcsa] CMD_START_DECODER: no decode demux, skipping\n");
+			SendCmdReady(connfd);
+			break;
+		}
+
+		char demux_path[64];
+		snprintf(demux_path, sizeof(demux_path), "/dev/dvb/adapter%d/demux%d",
+			msg.adapter, msg.decode_demux);
+
+		/* Raw ioctls instead of HAL — HAL's Start() bundles
+		 * VIDEO_SELECT_SOURCE + VIDEO_PLAY, but we need SELECT_SOURCE
+		 * BEFORE the PES filter and PLAY AFTER. */
+
+		/* Idempotency: close any fds from a previous CMD_START that wasn't
+		 * followed by CMD_STOP (e.g., rapid channel switches). */
+		if (softcsa_decode_video_fd >= 0) { ::close(softcsa_decode_video_fd); softcsa_decode_video_fd = -1; }
+		if (softcsa_decode_audio_fd >= 0) { ::close(softcsa_decode_audio_fd); softcsa_decode_audio_fd = -1; }
+		if (softcsa_decode_pcr_fd >= 0) { ::close(softcsa_decode_pcr_fd); softcsa_decode_pcr_fd = -1; }
+		if (softcsa_video_dev_fd >= 0) { ::close(softcsa_video_dev_fd); softcsa_video_dev_fd = -1; }
+		if (softcsa_audio_dev_fd >= 0) { ::close(softcsa_audio_dev_fd); softcsa_audio_dev_fd = -1; }
+
+		/* === Audio setup === */
+		int audio_dev_fd = -1;
+		if (msg.apid) {
+			char audio_path[64];
+			snprintf(audio_path, sizeof(audio_path), "/dev/dvb/adapter%d/audio0", msg.adapter);
+			audio_dev_fd = ::open(audio_path, O_RDWR | O_CLOEXEC);
+			if (audio_dev_fd >= 0) {
+				/* Open decode demux fd BEFORE SELECT_SOURCE */
+				int afd = ::open(demux_path, O_RDWR | O_CLOEXEC);
+				/* AUDIO_SELECT_SOURCE must come BEFORE PES filter */
+				if (ioctl(audio_dev_fd, AUDIO_SELECT_SOURCE, 0) < 0)
+					printf("[softcsa] AUDIO_SELECT_SOURCE failed: %s\n", strerror(errno));
+				/* AUDIO0 PES filter on decode demux */
+				if (afd >= 0) {
+					struct dmx_pes_filter_params pes;
+					memset(&pes, 0, sizeof(pes));
+					pes.pid = msg.apid;
+					pes.input = DMX_IN_FRONTEND;
+					pes.output = DMX_OUT_DECODER;
+					pes.pes_type = DMX_PES_AUDIO0;
+					pes.flags = 0;
+					if (ioctl(afd, DMX_SET_PES_FILTER, &pes) == 0) {
+						ioctl(afd, DMX_START);
+						softcsa_decode_audio_fd = afd;
+					} else {
+						printf("[softcsa] AUDIO0 DMX_SET_PES_FILTER failed: %s\n", strerror(errno));
+						::close(afd);
+						::close(audio_dev_fd);
+						audio_dev_fd = -1;
+					}
+				} else {
+					::close(audio_dev_fd);
+					audio_dev_fd = -1;
+				}
+				if (audio_dev_fd >= 0) {
+					/* Set codec, then start playback */
+					ioctl(audio_dev_fd, AUDIO_SET_BYPASS_MODE, msg.audio_type);
+					ioctl(audio_dev_fd, AUDIO_PAUSE, 0);
+					ioctl(audio_dev_fd, AUDIO_PLAY, 0);
+					printf("[softcsa] CMD_START_DECODER: audio started (dev_fd=%d, demux_fd=%d)\n",
+						audio_dev_fd, softcsa_decode_audio_fd);
+				}
+			} else {
+				printf("[softcsa] failed to open audio device: %s\n", strerror(errno));
+			}
+		}
+
+		/* === Video setup === */
+		int video_dev_fd = -1;
+		if (msg.vpid) {
+			char video_path[64];
+			snprintf(video_path, sizeof(video_path), "/dev/dvb/adapter%d/video0", msg.adapter);
+			video_dev_fd = ::open(video_path, O_RDWR | O_CLOEXEC);
+			if (video_dev_fd >= 0) {
+				/* Open decode demux fd BEFORE SELECT_SOURCE */
+				int vfd = ::open(demux_path, O_RDWR | O_CLOEXEC);
+				/* VIDEO_SELECT_SOURCE must come BEFORE PES filter */
+				if (ioctl(video_dev_fd, VIDEO_SELECT_SOURCE, 0) < 0)
+					printf("[softcsa] VIDEO_SELECT_SOURCE failed: %s\n", strerror(errno));
+				/* VIDEO_SET_STREAMTYPE */
+				if (ioctl(video_dev_fd, VIDEO_SET_STREAMTYPE, msg.video_type) < 0)
+					printf("[softcsa] VIDEO_SET_STREAMTYPE(%d) failed: %s\n", msg.video_type, strerror(errno));
+				/* VIDEO0 PES filter on decode demux */
+				if (vfd >= 0) {
+					struct dmx_pes_filter_params pes;
+					memset(&pes, 0, sizeof(pes));
+					pes.pid = msg.vpid;
+					pes.input = DMX_IN_FRONTEND;
+					pes.output = DMX_OUT_DECODER;
+					pes.pes_type = DMX_PES_VIDEO0;
+					pes.flags = 0;
+					if (ioctl(vfd, DMX_SET_PES_FILTER, &pes) == 0) {
+						ioctl(vfd, DMX_START);
+						softcsa_decode_video_fd = vfd;
+					} else {
+						printf("[softcsa] VIDEO0 DMX_SET_PES_FILTER failed: %s\n", strerror(errno));
+						::close(vfd);
+						::close(video_dev_fd);
+						video_dev_fd = -1;
+					}
+				} else {
+					::close(video_dev_fd);
+					video_dev_fd = -1;
+				}
+				if (video_dev_fd >= 0) {
+					/* Start video playback */
+					ioctl(video_dev_fd, VIDEO_FREEZE, 0);
+					ioctl(video_dev_fd, VIDEO_PLAY, 0);
+					ioctl(video_dev_fd, VIDEO_SLOWMOTION, 0);
+					ioctl(video_dev_fd, VIDEO_FAST_FORWARD, 0);
+					ioctl(video_dev_fd, VIDEO_CONTINUE, 0);
+					printf("[softcsa] CMD_START_DECODER: video started (dev_fd=%d, demux_fd=%d)\n",
+						video_dev_fd, softcsa_decode_video_fd);
+				}
+			} else {
+				printf("[softcsa] failed to open video device: %s\n", strerror(errno));
+			}
+		}
+		/* === PCR setup === */
+		if (msg.pcrpid) {
+			int pcr_fd = ::open(demux_path, O_RDWR | O_CLOEXEC);
+			if (pcr_fd >= 0) {
+				struct dmx_pes_filter_params pes;
+				memset(&pes, 0, sizeof(pes));
+				pes.pid = msg.pcrpid;
+				pes.input = DMX_IN_FRONTEND;
+				pes.output = DMX_OUT_DECODER;
+				pes.pes_type = DMX_PES_PCR0;
+				pes.flags = 0;
+				if (ioctl(pcr_fd, DMX_SET_PES_FILTER, &pes) == 0) {
+					ioctl(pcr_fd, DMX_START);
+					softcsa_decode_pcr_fd = pcr_fd;
+					printf("[softcsa] CMD_START_DECODER: PCR started (demux_fd=%d)\n", pcr_fd);
+				} else {
+					printf("[softcsa] PCR0 DMX_SET_PES_FILTER failed: %s\n", strerror(errno));
+					::close(pcr_fd);
+				}
+			}
+		}
+
+		/* Finalize audio */
+		if (audio_dev_fd >= 0)
+			ioctl(audio_dev_fd, AUDIO_CONTINUE, 0);
+
+		/* Store device fds for cleanup */
+		softcsa_video_dev_fd = video_dev_fd;
+		softcsa_audio_dev_fd = audio_dev_fd;
+
+		printf("[softcsa] CMD_START_DECODER: complete\n");
+		SendCmdReady(connfd);
+		break;
+	}
+#endif
 #if 0
 	case CZapitMessages::CMD_SET_DISPLAY_FORMAT: {
 		CZapitMessages::commandInt msg;
@@ -2501,6 +2795,47 @@ bool CZapit::StartPlayBack(CZapitChannel *thisChannel)
 bool CZapit::StopPlayBack(bool send_pmt, bool blank)
 {
 	INFO("standby %d playing %d forced %d send_pmt %d", standby, playing, playbackStopForced, send_pmt);
+#ifdef HAVE_SOFTCSA
+	/* SoftCSA cleanup — only runs if CMD_STOP_DECODER actually executed.
+	 * For FTA channels (or channels where OSCam never sent CSA_ALT),
+	 * softcsa_decoder_stopped is false and this entire block is skipped.
+	 * The standard StopPlayBack path below then runs unchanged. */
+	if (softcsa_decoder_stopped) {
+		softcsa_decoder_stopped = false;
+		/* Stop loopback session (reader thread, DVR write, decode demux) */
+		if (current_channel)
+			CSoftCSAManager::getInstance()->stopSession(
+				current_channel->getChannelID(), SOFTCSA_SESSION_LIVE);
+		/* Close SoftCSA decoder fds from CMD_START_DECODER */
+		if (softcsa_decode_video_fd >= 0) {
+			::close(softcsa_decode_video_fd);
+			softcsa_decode_video_fd = -1;
+		}
+		if (softcsa_decode_audio_fd >= 0) {
+			::close(softcsa_decode_audio_fd);
+			softcsa_decode_audio_fd = -1;
+		}
+		if (softcsa_decode_pcr_fd >= 0) {
+			::close(softcsa_decode_pcr_fd);
+			softcsa_decode_pcr_fd = -1;
+		}
+		if (softcsa_video_dev_fd >= 0) {
+			::close(softcsa_video_dev_fd);
+			softcsa_video_dev_fd = -1;
+		}
+		if (softcsa_audio_dev_fd >= 0) {
+			::close(softcsa_audio_dev_fd);
+			softcsa_audio_dev_fd = -1;
+		}
+		/* Reopen HAL decoder devices — CMD_STOP_DECODER closed them so
+		 * CMD_START_DECODER could open raw fds (video0/audio0 allow one open).
+		 * After reopening, the standard path below runs normally. */
+		if (videoDecoder)
+			videoDecoder->openDevice();
+		if (audioDecoder)
+			audioDecoder->openDevice();
+	}
+#endif
 	if(send_pmt)
 		CCamManager::getInstance()->Stop(live_channel_id, CCamManager::PLAY);
 
@@ -2811,6 +3146,18 @@ bool CZapit::Start(Z_start_arg *ZapStart_arg)
 #endif
 
 	ca->Start();
+
+#ifdef HAVE_SOFTCSA
+	{
+		static CDvbApiClient *dvbapi_client = NULL;
+		if (!dvbapi_client) {
+			dvbapi_client = new CDvbApiClient();
+			dvbapi_client->setManager(CSoftCSAManager::getInstance());
+			CCamManager_SetDvbApiClient(dvbapi_client);
+			printf("[zapit] SoftCSA: CDvbApiClient initialized (lazy connect)\n");
+		}
+	}
+#endif
 
 	eventServer = new CEventServer;
 	if (!zapit_server.prepare(ZAPIT_UDS_NAME)) {

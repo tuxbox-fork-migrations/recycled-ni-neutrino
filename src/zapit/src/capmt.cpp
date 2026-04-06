@@ -34,6 +34,19 @@
 #include <dvbsi++/program_map_section.h>
 #include <dvbsi++/ca_program_map_section.h>
 
+#ifdef HAVE_SOFTCSA
+#include "dvbapi_client.h"
+#include <driver/softcsa/softcsa_manager.h>
+
+/* CDvbApiClient singleton, initialized from zapit.cpp */
+static CDvbApiClient *dvbapi_client = NULL;
+
+void CCamManager_SetDvbApiClient(CDvbApiClient *client)
+{
+	dvbapi_client = client;
+}
+#endif
+
 //#define DEBUG_CAPMT
 
 CCam::CCam()
@@ -125,6 +138,24 @@ bool CCam::makeCaPmt(CZapitChannel * channel, bool add_private, uint8_t list, co
 		tmp[9] = channel->getOriginalNetworkId() & 0xFF;
 
 		capmt.injectDescriptor(tmp, false);
+
+#ifdef HAVE_SOFTCSA
+		/* DVBAPI protocol v3 descriptors */
+		tmp[0] = 0x83; /* adapter device */
+		tmp[1] = 0x01;
+		tmp[2] = 0x00; /* adapter_index */
+		capmt.injectDescriptor(tmp, false);
+
+		tmp[0] = 0x86; /* demux device */
+		tmp[1] = 0x01;
+		tmp[2] = (source_demux >= 0) ? (uint8_t)source_demux : 0x00;
+		capmt.injectDescriptor(tmp, false);
+
+		tmp[0] = 0x87; /* CA device */
+		tmp[1] = 0x01;
+		tmp[2] = 0x00; /* ca_device_index */
+		capmt.injectDescriptor(tmp, false);
+#endif
 	}
 
 	calen = capmt.writeToBuffer(cabuf);
@@ -354,6 +385,40 @@ bool CCamManager::SetMode(t_channel_id channel_id, enum runmode mode, bool start
 		if(newmask != 0 && (!filter_channels || !channel->bUseCI)) {
 			INFO("\033[33m socket only\033[0m");
 			cam->makeCaPmt(channel, true);
+#ifdef HAVE_SOFTCSA
+			if ((mode == PLAY || mode == RECORD || mode == PIP) && dvbapi_client && dvbapi_client->ensureConnected()) {
+				uint32_t demux_index = (source >= 0) ? (uint32_t)source : 0;
+				SoftCSASessionType stype = (mode == RECORD) ? SOFTCSA_SESSION_RECORD :
+				                           (mode == PIP) ? SOFTCSA_SESSION_PIP : SOFTCSA_SESSION_LIVE;
+
+				CSoftCSAManager::getInstance()->registerDemux(
+					demux_index, channel->getChannelID(),
+					stype, 0 /* adapter */, demux_index, source);
+
+				if (channel->getVideoPid())
+					CSoftCSAManager::getInstance()->addPid(demux_index, channel->getVideoPid());
+				if (channel->getAudioPid())
+					CSoftCSAManager::getInstance()->addPid(demux_index, channel->getAudioPid());
+				if (channel->getPcrPid() && channel->getPcrPid() != channel->getVideoPid())
+					CSoftCSAManager::getInstance()->addPid(demux_index, channel->getPcrPid());
+				if (channel->getPmtPid())
+					CSoftCSAManager::getInstance()->addPid(demux_index, channel->getPmtPid());
+
+				CSoftCSAManager::getInstance()->setDecoderPids(demux_index,
+					channel->getVideoPid(),
+					channel->getAudioPid(),
+					channel->getPcrPid());
+
+				CSoftCSAManager::getInstance()->setDecoderTypes(demux_index,
+					channel->type,
+					channel->getAudioChannel() ? channel->getAudioChannel()->audioChannelType : 0);
+
+				if (!dvbapi_client->sendCaPmt(cam->getBuffer(), cam->getLength(),
+				                              channel->getServiceId()))
+					printf("[softcsa] sendCaPmt failed for channel %llx\n",
+					       (unsigned long long)channel->getChannelID());
+			} else
+#endif
 			cam->setCaPmt(true);
 #if 0
 			// CI

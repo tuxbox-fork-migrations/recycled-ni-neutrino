@@ -153,7 +153,9 @@ class CZapitMessages
 			CMD_GET_VIDEO_FORMAT	   = 113,
 			CMD_STOP_PIP			   = 114,
 			CMD_ZAPTO_EPG			   = 115,
-			CMD_LOCKRC				   = 116
+			CMD_LOCKRC				   = 116,
+			CMD_SOFTCSA_STOP_DECODER		   = 117,
+			CMD_SOFTCSA_START_DECODER		   = 118
 		};
 
 	struct commandBoolean
@@ -161,6 +163,37 @@ class CZapitMessages
 		bool truefalse;
 		commandBoolean():truefalse(false){}
 	};
+
+#ifdef HAVE_SOFTCSA
+	struct commandSoftCSAStart
+	{
+		int decode_demux;
+		int adapter;
+		unsigned short vpid;
+		unsigned short apid;
+		unsigned short pcrpid;
+		int video_type;
+		int audio_type;
+		commandSoftCSAStart() : decode_demux(-1), adapter(0), vpid(0),
+			apid(0), pcrpid(0), video_type(0), audio_type(0) {}
+	};
+
+	/* CMD_STOP_DECODER sends PIDs so zapit can open the reader in the same
+	 * thread context (Enigma2-style: no gap between decoder close and reader open).
+	 * PIDs are packed as: pids[0] = primary (PAT), pids[1..n-1] = additional. */
+	struct commandSoftCSAStop
+	{
+		int adapter;
+		int demux_unit;          /* physical demux device for reader (typically 0) */
+		int num_pids;
+		unsigned short pids[32]; /* max 32 PIDs (PAT + service + PSI) */
+	};
+
+	struct responseSoftCSAStop
+	{
+		int reader_fd;           /* opened TSDEMUX_TAP fd on demux0, or -1 on error */
+	};
+#endif
 
 	struct commandInt
 	{
