@@ -15,6 +15,7 @@ CSoftCSASession::CSoftCSASession(SoftCSASessionType type, int adapter, int demux
 	: session_type(type)
 	, engine(new CSoftCSAEngine())
 	, demux(NULL)
+	, reader_fd(-1)
 	, dvr_fd(-1)
 	, record_fd(-1)
 	, adapter_num(adapter)
@@ -31,11 +32,11 @@ CSoftCSASession::CSoftCSASession(SoftCSASessionType type, int adapter, int demux
 		buffer = NULL;
 	}
 
-	/* Use cDemux for TS reading — same mechanism as recording.
-	 * The HAL opens with O_RDWR|O_NONBLOCK and manages the fd internally.
-	 * This works for both LIVE (DVR loopback) and RECORD (file write). */
-	demux = new cDemux(demux_unit);
-	demux->Open(DMX_TP_CHANNEL, NULL, BUFFER_SIZE);
+	if (type == SOFTCSA_SESSION_RECORD) {
+		/* Recording: use cDemux on the recording unit (no DVR loopback needed) */
+		demux = new cDemux(demux_unit);
+		demux->Open(DMX_TP_CHANNEL, NULL, BUFFER_SIZE);
+	}
 }
 
 CSoftCSASession::~CSoftCSASession()
@@ -48,6 +49,10 @@ CSoftCSASession::~CSoftCSASession()
 	demux = NULL;
 	free(buffer);
 	buffer = NULL;
+	if (reader_fd >= 0) {
+		::close(reader_fd);
+		reader_fd = -1;
+	}
 }
 
 void CSoftCSASession::setDecoderPids(unsigned short vpid, unsigned short apid, unsigned short pcrpid)
@@ -61,7 +66,7 @@ void CSoftCSASession::addPid(unsigned short pid)
 {
 	pids.push_back(pid);
 
-	/* Forward PIDs to cDemux immediately (LIVE and RECORD) */
+	/* Recording mode: forward PIDs to cDemux immediately */
 	if (demux) {
 		if (pids.size() == 1)
 			demux->pesFilter(pid);
@@ -72,14 +77,27 @@ void CSoftCSASession::addPid(unsigned short pid)
 
 bool CSoftCSASession::addReaderPid(unsigned short pid)
 {
-	if (!demux)
+	if (reader_fd < 0)
 		return false;
 
-	if (!demux->addPid(pid)) {
-		printf("[softcsa] addReaderPid %04x failed\n", pid);
+	uint16_t p = pid;
+	if (ioctl(reader_fd, DMX_ADD_PID, &p) < 0) {
+		printf("[softcsa] addReaderPid %04x failed: %s\n", pid, strerror(errno));
 		return false;
 	}
 	printf("[softcsa] addReaderPid %04x ok\n", pid);
+	return true;
+}
+
+bool CSoftCSASession::setupReader(int fd)
+{
+	if (fd < 0) {
+		printf("[softcsa] setupReader: invalid fd %d\n", fd);
+		return false;
+	}
+	reader_fd = fd;
+	printf("[softcsa] reader fd=%d on demux%d (from CMD_STOP_DECODER)\n",
+		reader_fd, demux_unit);
 	return true;
 }
 
@@ -138,13 +156,17 @@ bool CSoftCSASession::setupDecoder()
 	return true;
 }
 
-bool CSoftCSASession::start()
+bool CSoftCSASession::start(int reader_fd_param)
 {
 	if (running.load())
 		return false;
 
-	if (!buffer || !demux) {
-		printf("[softcsa] start: no buffer or demux\n");
+	/* Store reader fd immediately so the destructor always closes it,
+	 * even if we bail out early. Prevents fd leak on error paths. */
+	reader_fd = reader_fd_param;
+
+	if (!buffer) {
+		printf("[softcsa] start: no buffer allocated\n");
 		return false;
 	}
 
@@ -158,12 +180,13 @@ bool CSoftCSASession::start()
 		return false;
 	}
 
-	/* Start the demux filter — identical to cRecord::Start() path.
-	 * The HAL cDemux was already configured by addPid() → pesFilter()/addPid(). */
-	demux->Start();
+	if (reader_fd < 0) {
+		printf("[softcsa] start: invalid reader fd %d\n", reader_fd);
+		return false;
+	}
 
-	printf("[softcsa] start: demux%d (HAL cDemux, DMX_TP_CHANNEL), decode demux%d\n",
-		demux_unit, decode_demux_unit);
+	printf("[softcsa] start: reader fd=%d on demux%d, decode demux%d\n",
+		reader_fd, demux_unit, decode_demux_unit);
 
 	running = true;
 	worker = std::thread(&CSoftCSASession::loopbackThread, this);
@@ -206,12 +229,16 @@ void CSoftCSASession::stop()
 		worker.join();
 
 	if (session_type == SOFTCSA_SESSION_LIVE || session_type == SOFTCSA_SESSION_PIP) {
-		/* Restore decode demux source to default */
+		/* Close reader demux fd (after thread has exited) */
+		if (reader_fd >= 0) {
+			::close(reader_fd);
+			reader_fd = -1;
+		}
+		/* Restore demux sources to default */
 		if (decode_demux_unit >= 0)
 			cDemux::SetSource(decode_demux_unit, (int)DMX_SOURCE_FRONT0);
 	}
 
-	/* Stop cDemux (LIVE and RECORD) — closes the HAL fd */
 	if (demux)
 		demux->Stop();
 }
@@ -224,18 +251,47 @@ bool CSoftCSASession::setupDecoderOnly()
 void CSoftCSASession::loopbackThread()
 {
 	set_threadname("n:softcsa_lb");
-	printf("[softcsa] loopback thread started (dvr_fd=%d)\n", dvr_fd);
+	printf("[softcsa] loopback thread started (reader_fd=%d, dvr_fd=%d)\n",
+		reader_fd, dvr_fd);
 
+	int poll_count = 0;
 	int read_count = 0;
 	long long total_bytes = 0;
 	bool first_data = true;
 
 	while (running) {
-		/* Read via HAL cDemux — identical to recordThread().
-		 * cDemux::Read() does poll+read internally with timeout. */
-		int len = demux->Read(buffer, BUFFER_SIZE, 100); /* 100ms timeout */
-		if (len <= 0)
+		struct pollfd pfd;
+		pfd.fd = reader_fd;
+		pfd.events = POLLIN;
+		int ret = ::poll(&pfd, 1, 100); /* 100ms timeout */
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			if (!running) break; /* fd closed during stop() */
+			printf("[softcsa] poll error: %s\n", strerror(errno));
+			break;
+		}
+		poll_count++;
+		if (ret == 0) {
+			if (poll_count % 50 == 0) /* log every 5 seconds */
+				printf("[softcsa] diag: %d polls, %d reads, %lld bytes total\n",
+					poll_count, read_count, total_bytes);
+			continue; /* timeout, check running flag */
+		}
+		if (!(pfd.revents & POLLIN)) {
+			if (pfd.revents)
+				printf("[softcsa] poll revents: 0x%x\n", pfd.revents);
 			continue;
+		}
+
+		int len = ::read(reader_fd, buffer, BUFFER_SIZE);
+		if (len <= 0) {
+			if (len < 0 && errno != EAGAIN) {
+				if (!running) break; /* fd closed during stop() */
+				printf("[softcsa] read error: %s\n", strerror(errno));
+			}
+			continue;
+		}
 
 		if (first_data) {
 			printf("[softcsa] first data: %d bytes, PIDs:\n", len);

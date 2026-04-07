@@ -33,7 +33,7 @@ public:
 	bool addReaderPid(unsigned short pid);
 
 	// Start/stop the loopback or recording
-	bool start();             // LIVE/PIP: start DVR loopback thread
+	bool start(int reader_fd = -1); // LIVE/PIP: start DVR loopback thread
 	bool startRecord(int fd); // RECORD: start descramble-to-file thread
 	void stop();
 	bool setupDecoderOnly();  // set up decode demux (demux7 DVR) without starting thread
@@ -46,13 +46,15 @@ public:
 private:
 	void loopbackThread();
 	void recordThread();
+	bool setupReader(int fd);
 	bool setupDecoder();
 
 	SoftCSASessionType session_type;
 	CSoftCSAEngine *engine;
-	cDemux *demux;           // HAL demux for TS reading (LIVE and RECORD)
+	cDemux *demux;           // only used for RECORD mode
 
-	int dvr_fd;              // write fd on dvr{DECODE_DEMUX} (LIVE only)
+	int reader_fd;           // direct fd on dedicated reader demux (TSDEMUX_TAP)
+	int dvr_fd;              // write fd on dvr{DECODE_DEMUX}
 
 	int record_fd;           // not owned by this session; caller manages lifetime
 	int adapter_num;
