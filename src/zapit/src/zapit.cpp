@@ -2010,21 +2010,10 @@ bool CZapit::ParseCommand(CBasicMessage::Header &rmsg, int connfd)
 #ifdef HAVE_SOFTCSA
 	case CZapitMessages::CMD_SOFTCSA_STOP_DECODER:
 	{
-		/* Enigma2-identical sequence: stop decoder, then open reader on demux0
-		 * in the SAME thread context. No IPC gap between close and open.
-		 * Section filter fds (pmtDemux, sectionsd) remain open on demux0,
-		 * keeping XPT state alive throughout the transition. */
-		CZapitMessages::commandSoftCSAStop msg;
-		CBasicServer::receive_data(connfd, &msg, sizeof(msg));
-
-		/* Clamp num_pids to array bounds (defensive, client already clamps) */
-		if (msg.num_pids < 0) msg.num_pids = 0;
-		if (msg.num_pids > 32) msg.num_pids = 32;
-
-		printf("[softcsa] CMD_STOP_DECODER: adapter=%d demux=%d num_pids=%d\n",
-			msg.adapter, msg.demux_unit, msg.num_pids);
-
-		/* === Phase 1: Close decoder PES filters (DMX_STOP + close) === */
+		/* Close decoder PES filters and devices so the SoftCSA loopback
+		 * can take over. The cDemux reader on demux0 was already set up
+		 * by the session (like recording) before this IPC call. */
+		printf("[softcsa] CMD_STOP_DECODER: closing demux fds, stopping decoder\n");
 		if (videoDemux) videoDemux->Close();
 		if (audioDemux) audioDemux->Close();
 		if (pcrDemux) pcrDemux->Close();
@@ -2036,7 +2025,6 @@ bool CZapit::ParseCommand(CBasicMessage::Header &rmsg, int connfd)
 			videoDecoder->closeDevice();
 		if (audioDecoder)
 			audioDecoder->closeDevice();
-
 		/* Close any fds from a previous SoftCSA session */
 		if (softcsa_decode_video_fd >= 0) {
 			::close(softcsa_decode_video_fd);
@@ -2058,58 +2046,9 @@ bool CZapit::ParseCommand(CBasicMessage::Header &rmsg, int connfd)
 			::close(softcsa_audio_dev_fd);
 			softcsa_audio_dev_fd = -1;
 		}
-
-		printf("[softcsa] CMD_STOP_DECODER: decoder closed\n");
+		printf("[softcsa] CMD_STOP_DECODER: done\n");
 		softcsa_decoder_stopped = true;
-
-		/* === Phase 2: Open reader on demux0 (same thread, no gap) === */
-		CZapitMessages::responseSoftCSAStop response;
-		response.reader_fd = -1;
-
-		if (msg.num_pids > 0) {
-			char demux_path[64];
-			snprintf(demux_path, sizeof(demux_path), "/dev/dvb/adapter%d/demux%d",
-				msg.adapter, msg.demux_unit);
-
-			int rfd = ::open(demux_path, O_RDONLY | O_CLOEXEC);
-			if (rfd >= 0) {
-				/* 1MB buffer — matches Enigma2 */
-				if (ioctl(rfd, DMX_SET_BUFFER_SIZE, 1024 * 1024) < 0)
-					printf("[softcsa] DMX_SET_BUFFER_SIZE 1MB failed: %s\n", strerror(errno));
-
-				/* TSDEMUX_TAP with PAT as primary PID — matches Enigma2 */
-				struct dmx_pes_filter_params pes;
-				memset(&pes, 0, sizeof(pes));
-				pes.pid = msg.pids[0];
-				pes.input = DMX_IN_FRONTEND;
-				pes.output = DMX_OUT_TSDEMUX_TAP;
-				pes.pes_type = DMX_PES_OTHER;
-				pes.flags = 0;
-
-				if (ioctl(rfd, DMX_SET_PES_FILTER, &pes) == 0 &&
-				    ioctl(rfd, DMX_START) == 0) {
-					/* Add remaining PIDs */
-					for (int i = 1; i < msg.num_pids; i++) {
-						uint16_t p = msg.pids[i];
-						if (ioctl(rfd, DMX_ADD_PID, &p) < 0)
-							printf("[softcsa] DMX_ADD_PID %04x failed: %s\n",
-								p, strerror(errno));
-					}
-					response.reader_fd = rfd;
-					printf("[softcsa] CMD_STOP_DECODER: reader on demux%d fd=%d, %d PIDs\n",
-						msg.demux_unit, rfd, msg.num_pids);
-				} else {
-					printf("[softcsa] CMD_STOP_DECODER: PES filter/start failed: %s\n",
-						strerror(errno));
-					::close(rfd);
-				}
-			} else {
-				printf("[softcsa] CMD_STOP_DECODER: open %s failed: %s\n",
-					demux_path, strerror(errno));
-			}
-		}
-
-		CBasicServer::send_data(connfd, &response, sizeof(response));
+		SendCmdReady(connfd);
 		break;
 	}
 	case CZapitMessages::CMD_SOFTCSA_START_DECODER:

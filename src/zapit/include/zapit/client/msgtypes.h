@@ -178,21 +178,6 @@ class CZapitMessages
 			apid(0), pcrpid(0), video_type(0), audio_type(0) {}
 	};
 
-	/* CMD_STOP_DECODER sends PIDs so zapit can open the reader in the same
-	 * thread context (Enigma2-style: no gap between decoder close and reader open).
-	 * PIDs are packed as: pids[0] = primary (PAT), pids[1..n-1] = additional. */
-	struct commandSoftCSAStop
-	{
-		int adapter;
-		int demux_unit;          /* physical demux device for reader (typically 0) */
-		int num_pids;
-		unsigned short pids[32]; /* max 32 PIDs (PAT + service + PSI) */
-	};
-
-	struct responseSoftCSAStop
-	{
-		int reader_fd;           /* opened TSDEMUX_TAP fd on demux0, or -1 on error */
-	};
 #endif
 
 	struct commandInt

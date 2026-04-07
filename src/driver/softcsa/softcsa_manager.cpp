@@ -126,9 +126,10 @@ void CSoftCSAManager::onDescrMode(uint32_t demux_index, uint32_t algo, uint32_t 
 		return;
 	}
 
-	/* Phase 2: Create session and set up decode demux (demux7, DVR source).
-	 * This only touches demux7, not demux0 — safe to do before decoder stop. */
-	int reader_fd = -1;
+	/* Phase 2: Create session, configure PIDs via HAL cDemux, set up decode demux.
+	 * The cDemux reader is configured here (like recording) — pesFilter/addPid
+	 * open the HAL fd on demux0 while the decoder is still running. */
+	bool decoder_stopped = false;
 	bool session_started = false;
 	{
 		std::lock_guard<std::mutex> lock(mtx);
@@ -156,6 +157,8 @@ void CSoftCSAManager::onDescrMode(uint32_t demux_index, uint32_t algo, uint32_t 
 		printf("[softcsa] createSession: demux %u type %d, %zu stored PIDs\n",
 		       demux_index, ds.type, ds.pids.size());
 
+		/* addPid calls cDemux::pesFilter/addPid — this opens the HAL fd
+		 * on demux0 and configures the TSDEMUX_TAP filter (like recording). */
 		for (auto pid : ds.pids)
 			ds.session->addPid(pid);
 
@@ -173,8 +176,7 @@ void CSoftCSAManager::onDescrMode(uint32_t demux_index, uint32_t algo, uint32_t 
 			return;
 		}
 
-		/* LIVE: set up decode demux (demux7 DVR) BEFORE the IPC call.
-		 * This only touches demux7, not demux0. */
+		/* LIVE: set up decode demux (demux7 DVR) */
 		if (!ds.session->setupDecoderOnly()) {
 			printf("[softcsa] createSession: setupDecoder failed for demux %u\n", demux_index);
 			delete ds.session;
@@ -183,77 +185,28 @@ void CSoftCSAManager::onDescrMode(uint32_t demux_index, uint32_t algo, uint32_t 
 		}
 	}
 
-	/* Phase 3: Atomic stop decoder + open reader (IPC to zapit thread).
-	 * Builds PID list and sends to zapit which does the Enigma2-identical
-	 * sequence: close decoder fds → open reader fd on demux0 → return fd. */
+	/* Phase 3: Stop decoder hardware (IPC to zapit thread).
+	 * The cDemux reader on demux0 is already configured (Phase 2). */
 	if (is_live) {
-		/* Build PID list for the reader */
-		static const unsigned short psi_pids[] = {
-			0x0000, /* PAT */
-			0x0001, /* CAT */
-			0x0010, /* NIT */
-			0x0011, /* SDT */
-			0x0012, /* EIT */
-		};
-		std::vector<unsigned short> all_pids;
-		for (size_t i = 0; i < sizeof(psi_pids) / sizeof(psi_pids[0]); i++)
-			all_pids.push_back(psi_pids[i]);
-
-		{
-			std::lock_guard<std::mutex> lock(mtx);
-			auto it = demux_states.find(demux_index);
-			if (it != demux_states.end() && it->second.session) {
-				for (auto pid : it->second.pids)
-					all_pids.push_back(pid);
-			}
-		}
-
-		int adapter = 0, demux_unit = 0;
-		{
-			std::lock_guard<std::mutex> lock(mtx);
-			auto it = demux_states.find(demux_index);
-			if (it != demux_states.end()) {
-				adapter = it->second.adapter;
-				demux_unit = it->second.demux_unit;
-			}
-		}
-
 		CZapitClient zapit;
-		reader_fd = zapit.stopSoftCSADecoder(adapter, demux_unit,
-			all_pids.data(), (int)all_pids.size());
-
-		printf("[softcsa] stopSoftCSADecoder returned reader_fd=%d\n", reader_fd);
+		zapit.stopSoftCSADecoder();
+		decoder_stopped = true;
 	}
 
-	/* Phase 4: Start loopback thread with the reader fd.
-	 * Ownership rule: if start() is called (even if it fails), the session
-	 * owns reader_fd (stored at top of start(), closed by destructor).
-	 * If start() is never called (session gone), we must close reader_fd. */
-	if (is_live && reader_fd >= 0) {
-		bool start_called = false;
-		{
-			std::lock_guard<std::mutex> lock(mtx);
-			auto it = demux_states.find(demux_index);
-			if (it != demux_states.end() && it->second.session) {
-				start_called = true;
-				if (it->second.session->start(reader_fd)) {
-					session_started = true;
-					for (auto pid : it->second.pending_reader_pids)
-						it->second.session->addReaderPid(pid);
-					it->second.pending_reader_pids.clear();
-				} else {
-					printf("[softcsa] createSession: start() failed\n");
-				}
+	/* Phase 4: Start loopback thread — cDemux::Start() + thread */
+	if (is_live) {
+		std::lock_guard<std::mutex> lock(mtx);
+		auto it = demux_states.find(demux_index);
+		if (it != demux_states.end() && it->second.session) {
+			if (it->second.session->start()) {
+				session_started = true;
+				for (auto pid : it->second.pending_reader_pids)
+					it->second.session->addReaderPid(pid);
+				it->second.pending_reader_pids.clear();
 			} else {
-				printf("[softcsa] createSession: session gone during IPC\n");
+				printf("[softcsa] createSession: start() failed\n");
 			}
 		}
-		if (!start_called) {
-			printf("[softcsa] closing orphaned reader_fd %d\n", reader_fd);
-			::close(reader_fd);
-		}
-	} else if (is_live) {
-		printf("[softcsa] createSession: no reader fd, loopback not started\n");
 	}
 
 	/* Clean up partial session if loopback was not started */
